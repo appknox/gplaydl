@@ -144,7 +144,3 @@ Profiles are stored as `.properties` files in the `gplaydl/profiles/` directory.
 |------|-----|---------|
 | `arm64` (default) | arm64-v8a | Modern phones (2017+) |
 | `armv7` | armeabi-v7a | Older 32-bit phones |
-
-## License
-
-MIT — see [LICENSE](LICENSE) for details.

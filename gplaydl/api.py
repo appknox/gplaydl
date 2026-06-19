@@ -11,6 +11,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -139,8 +140,8 @@ def _navigate(raw: bytes, *path: int) -> list[tuple[int, int, Any]]:
 # Headers
 # ---------------------------------------------------------------------------
 
-def _proto_headers(auth: dict) -> dict:
-    headers = build_headers(auth)
+def _proto_headers(auth: dict, country: Optional[str] = None) -> dict:
+    headers = build_headers(auth, country=country)
     headers["Content-Type"] = "application/x-protobuf"
     headers["Accept"] = "application/x-protobuf"
     return headers
@@ -207,10 +208,16 @@ def _parse_details_proto(raw: bytes) -> _ParsedDetails:
     return result
 
 
-def _fetch_details_raw(package: str, auth: dict) -> bytes:
+def _fetch_details_raw(
+    package: str, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> bytes:
     """Fetch raw protobuf details response."""
-    headers = _proto_headers(auth)
-    resp = httpx.get(f"{DETAILS_URL}?doc={package}", headers=headers, timeout=30)
+    headers = _proto_headers(auth, country=country)
+    url = f"{DETAILS_URL}?doc={package}"
+    if country:
+        url += f"&gl={country.upper()}"
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
     if resp.status_code == 404:
         raise PlayAPIError(f"App not found: {package}")
     if resp.status_code == 401:
@@ -220,17 +227,12 @@ def _fetch_details_raw(package: str, auth: dict) -> bytes:
     return resp.content
 
 
-def get_details_proto(package: str, auth: dict) -> tuple[str, str, int, str]:
-    """Fetch app details. Returns (docid, title, version_code, version_string)."""
-    parsed = _parse_details_proto(_fetch_details_raw(package, auth))
-    if not parsed.docid:
-        raise PlayAPIError("App not found or unavailable for this device profile.")
-    return parsed.docid, parsed.title, parsed.version_code, parsed.version_string
-
-
-def get_details(package: str, auth: dict) -> AppDetails:
+def get_details(
+    package: str, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> AppDetails:
     """Return structured app details."""
-    parsed = _parse_details_proto(_fetch_details_raw(package, auth))
+    parsed = _parse_details_proto(_fetch_details_raw(package, auth, country=country, proxy=proxy))
     if not parsed.docid:
         raise PlayAPIError("App not found or unavailable for this device profile.")
     return AppDetails(
@@ -249,12 +251,15 @@ def get_details(package: str, auth: dict) -> AppDetails:
 # Purchase
 # ---------------------------------------------------------------------------
 
-def purchase(package: str, version_code: int, auth: dict) -> None:
+def purchase(
+    package: str, version_code: int, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> None:
     """Acquire a free app (equivalent of clicking 'Install')."""
-    headers = build_headers(auth)
+    headers = build_headers(auth, country=country)
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     body = f"doc={package}&ot=1&vc={version_code}"
-    resp = httpx.post(PURCHASE_URL, headers=headers, content=body, timeout=30)
+    resp = httpx.post(PURCHASE_URL, headers=headers, content=body, timeout=30, proxy=proxy)
     if resp.status_code not in (200, 204):
         pass  # non-fatal — may already be "purchased"
 
@@ -272,15 +277,28 @@ def purchase(package: str, version_code: int, auth: dict) -> None:
 #   18 = additionalFile       (repeated message: 1=fileType, 2=size, 3=downloadUrl)
 #   29 = versionCode          (varint)
 
+_GOOGLE_CDN_SUFFIXES = (
+    ".google.com", ".googleapis.com", ".ggpht.com", ".googleusercontent.com",
+)
+
+
+def _safe_cdn_url(url: str) -> str:
+    """Return url only if it is HTTPS and hosted on a known Google domain, else ''."""
+    if not url.startswith("https://"):
+        return ""
+    host = urlparse(url).hostname or ""
+    if host == "android.clients.google.com" or any(host.endswith(s) for s in _GOOGLE_CDN_SUFFIXES):
+        return url
+    return ""
+
+
 def _parse_delivery(raw: bytes) -> DeliveryResult:
     """Parse a delivery response using ProtoDecoder."""
-    # Primary path: Payload at field 21 (current API)
     for payload_fn in (21, 5, 4, 6):
         add_fields = _navigate(raw, 1, payload_fn, 2)
-        if add_fields and _first_string(add_fields, 3):
+        if add_fields and _safe_cdn_url(_first_string(add_fields, 3)):
             return _extract_delivery_from_fields(add_fields)
 
-    # Last resort: tree walk for download URLs
     return _extract_delivery_from_tree(raw)
 
 
@@ -289,7 +307,7 @@ def _extract_delivery_from_fields(fields: list[tuple[int, int, Any]]) -> Deliver
     app_vc = _first_int(fields, 29) or 0
 
     result = DeliveryResult(
-        download_url=_first_string(fields, 3),
+        download_url=_safe_cdn_url(_first_string(fields, 3)),
         download_size=_first_int(fields, 1) or 0,
         sha1=_first_string(fields, 5),
     )
@@ -307,8 +325,8 @@ def _extract_delivery_from_fields(fields: list[tuple[int, int, Any]]) -> Deliver
             if name:
                 result.cookies.append({"name": name, "value": value})
         elif f1_wt == 0:
-            url = _first_string(cf, 4)
-            if url and url.startswith("https://"):
+            url = _safe_cdn_url(_first_string(cf, 4))
+            if url:
                 ft = _first_int(cf, 1) or 0
                 result.additional_files.append(AdditionalFile(
                     file_type=ft,
@@ -322,7 +340,7 @@ def _extract_delivery_from_fields(fields: list[tuple[int, int, Any]]) -> Deliver
     for split_b in _all_bytes(fields, 15):
         sf = ProtoDecoder(split_b).read_all_ordered()
         name = _first_string(sf, 1)
-        url = _first_string(sf, 5)
+        url = _safe_cdn_url(_first_string(sf, 5))
         if url:
             result.splits.append(SplitInfo(
                 name=name or f"split{len(result.splits)}",
@@ -331,11 +349,10 @@ def _extract_delivery_from_fields(fields: list[tuple[int, int, Any]]) -> Deliver
             ))
 
     # Field 18 (repeated) — asset pack APKs (fileType=2, gzip-compressed).
-    # Structure: f1=fileType, f2=size, f3=downloadUrl (string or sub-message).
     for af_b in _all_bytes(fields, 18):
         af = ProtoDecoder(af_b).read_all_ordered()
-        url = _first_string(af, 3)
-        if url and url.startswith("https://"):
+        url = _safe_cdn_url(_first_string(af, 3))
+        if url:
             ft = _first_int(af, 1) or 0
             result.additional_files.append(AdditionalFile(
                 file_type=ft,
@@ -348,23 +365,25 @@ def _extract_delivery_from_fields(fields: list[tuple[int, int, Any]]) -> Deliver
 
 
 def _extract_delivery_from_tree(raw: bytes) -> DeliveryResult:
-    """Fallback: scan all strings in the protobuf for download URLs."""
-    strings = extract_strings(raw)
-    cdn_urls = [s for s in strings if s.startswith("https://") and "android.clients.google.com" in s]
-    if not cdn_urls:
-        cdn_urls = [s for s in strings if s.startswith("https://") and ("play" in s or "goog" in s)]
-
+    """Fallback: scan protobuf strings for a valid Google CDN download URL."""
     result = DeliveryResult()
-    if cdn_urls:
-        result.download_url = cdn_urls[0]
+    for s in extract_strings(raw):
+        if _safe_cdn_url(s):
+            result.download_url = s
+            break
     return result
 
 
-def get_delivery(package: str, version_code: int, auth: dict) -> DeliveryResult:
+def get_delivery(
+    package: str, version_code: int, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> DeliveryResult:
     """Fetch download URLs for base APK, splits, and OBB files."""
-    headers = _proto_headers(auth)
+    headers = _proto_headers(auth, country=country)
     url = f"{DELIVERY_URL}?doc={package}&ot=1&vc={version_code}"
-    resp = httpx.get(url, headers=headers, timeout=30)
+    if country:
+        url += f"&gl={country.upper()}"
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:
@@ -385,10 +404,16 @@ def get_delivery(package: str, version_code: int, auth: dict) -> DeliveryResult:
 # List splits (from details metadata)
 # ---------------------------------------------------------------------------
 
-def list_splits(package: str, auth: dict) -> list[str]:
+def list_splits(
+    package: str, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> list[str]:
     """Return split names from app details metadata."""
-    headers = _proto_headers(auth)
-    resp = httpx.get(f"{DETAILS_URL}?doc={package}", headers=headers, timeout=30)
+    headers = _proto_headers(auth, country=country)
+    url = f"{DETAILS_URL}?doc={package}"
+    if country:
+        url += f"&gl={country.upper()}"
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:
@@ -452,10 +477,16 @@ def _find_docv2(data: bytes, depth: int = 0, max_depth: int = 10) -> list[dict]:
     return results
 
 
-def search_apps(query: str, auth: dict, limit: int = 10) -> list[dict]:
+def search_apps(
+    query: str, auth: dict, limit: int = 10,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> list[dict]:
     """Search Google Play via FDFE protobuf API. Returns list of {package, title, creator}."""
-    headers = _proto_headers(auth)
-    resp = httpx.get(f"{SEARCH_URL}?q={query}&c=3", headers=headers, timeout=30)
+    headers = _proto_headers(auth, country=country)
+    url = f"{SEARCH_URL}?q={query}&c=3"
+    if country:
+        url += f"&gl={country.upper()}"
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:

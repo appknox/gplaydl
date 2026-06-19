@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import random
+import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -25,9 +28,9 @@ from gplaydl.auth import (
     clear_auth,
     ensure_auth,
     fetch_token,
-    load_cached_auth,
     save_auth,
 )
+from gplaydl.profiles import ARM64_PROFILES, ARMV7_PROFILES, find_profile, get_latest_probe_profiles
 from gplaydl.download import DownloadSpec, download_batch
 
 console = Console()
@@ -49,7 +52,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
+    version: bool = typer.Option(  # noqa: ARG001
         False, "--version", "-V", callback=_version_callback, is_eager=True,
         help="Show version and exit.",
     ),
@@ -65,8 +68,16 @@ def auth(
     arch: str = typer.Option("arm64", help="Architecture: arm64 or armv7."),
     dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
     clear: bool = typer.Option(False, "--clear", help="Remove all cached tokens."),
+    country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code to register device in that region (e.g. IN, JP, BR)."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for dispenser + FDFE calls."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring (e.g. 'Pv' or 'samsung'). Run 'gplaydl profiles' to list all."),
 ) -> None:
-    """Acquire an anonymous auth token from the dispenser."""
+    """Acquire an anonymous auth token from the dispenser.
+
+    Use --country to register the device with a specific region's MCC/MNC,
+    so subsequent info/download calls with the same --country get that
+    region's catalog without needing a proxy.
+    """
     if clear:
         clear_auth()
         rprint("[green]All cached tokens removed.[/green]")
@@ -74,16 +85,18 @@ def auth(
 
     rprint(f"[dim]Dispenser:[/dim] {dispenser or 'https://auroraoss.com/api/auth'}")
     rprint(f"[dim]Architecture:[/dim] {arch}")
+    if country:
+        rprint(f"[dim]Country:[/dim] {country.upper()}")
     rprint()
 
     with console.status("Rotating through device profiles..."):
-        data = fetch_token(dispenser_url=dispenser, arch=arch)
+        data = fetch_token(dispenser_url=dispenser, arch=arch, country=country, proxy=proxy, profile=profile)
 
     if not data:
         err.print("[red]Authentication failed — all profiles rejected.[/red]")
         raise typer.Exit(code=1)
 
-    path = save_auth(data, arch)
+    path = save_auth(data, arch, country)
     rprint(Panel.fit(
         f"[bold green]Authenticated[/bold green]\n"
         f"Email  : {data.get('email', 'N/A')}\n"
@@ -91,6 +104,124 @@ def auth(
         f"Saved  : {path}",
         title="Token",
     ))
+
+
+# ── profiles ────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def profiles(
+    arch: str = typer.Option("all", help="Filter by arch: arm64, armv7, or all."),
+) -> None:
+    """List available device profiles."""
+    pool: list[tuple[str, dict]] = []
+    if arch in ("arm64", "all"):
+        pool += [(k, p, "arm64") for k, p in ARM64_PROFILES]
+    if arch in ("armv7", "all"):
+        pool += [(k, p, "armv7") for k, p in ARMV7_PROFILES]
+
+    table = Table(title="Device Profiles")
+    table.add_column("Key", style="bold", width=6)
+    table.add_column("Name")
+    table.add_column("Arch", style="dim", width=8)
+    table.add_column("Android", style="dim", width=8)
+    for key, p, a in pool:
+        table.add_row(key, p.get("UserReadableName", key), a, p.get("Build.VERSION.RELEASE", "?"))
+    console.print(table)
+
+
+# ── latest ──────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def latest(
+    package: str = typer.Argument(..., help="Package name (e.g. com.whatsapp)."),
+    arch: str = typer.Option("arm64", help="Architecture for token."),
+    country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code."),
+    dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
+    probes: int = typer.Option(10, "--probes", "-n", help="Max fresh GSF IDs to sample (default 10)."),
+    stable: int = typer.Option(3, "--stable", "-s", help="Stop early when max version unchanged for this many consecutive probes (default 3)."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Device profile for all probes (e.g. 'Galaxy S25 Ultra'). Defaults to top-ranked."),
+) -> None:
+    """Find the latest available version by probing multiple fresh GSF IDs."""
+    if profile:
+        found = find_profile(profile, arch)
+        if not found:
+            err.print(f"[red]Profile not found: {profile}[/red]")
+            raise typer.Exit(code=1)
+        profile_key, profile_data = found
+    else:
+        top = get_latest_probe_profiles(arch, n=1)
+        if not top:
+            err.print("[red]No profiles available.[/red]")
+            raise typer.Exit(code=1)
+        profile_key, profile_data = top[0]
+
+    device_name = profile_data.get("UserReadableName", profile_key)
+    rprint(f"[dim]Profile:[/dim] {device_name}  [dim]Max probes:[/dim] {probes}  [dim]Stable threshold:[/dim] {stable}")
+
+    results: list[tuple[str, str, int]] = []  # (gsf_prefix, version_string, version_code)
+    best_vc = 0
+    consecutive_stable = 0
+    backoff = 8.0
+    probe_count = 0
+
+    while probe_count < probes:
+        auth = fetch_token(arch=arch, profile=profile_key, dispenser_url=dispenser)
+        if auth is None:
+            jitter = backoff * 0.2 * (2 * random.random() - 1)
+            wait = min(backoff + jitter, 120.0)
+            err.print(f"[yellow]  Rate-limited — waiting {wait:.1f}s before retry...[/yellow]")
+            time.sleep(wait)
+            backoff = min(backoff * 2, 120.0)
+            continue
+
+        backoff = 8.0
+        probe_count += 1
+        gsf_prefix = str(auth.get("gsfId", "?"))[:8]
+
+        try:
+            details = get_details(package, auth, country=country)
+        except PlayAPIError as exc:
+            err.print(f"[dim]  probe {probe_count}: {gsf_prefix}... error: {exc}[/dim]")
+            continue
+
+        vc = details.version_code
+        vs = details.version_string
+        results.append((gsf_prefix, vs, vc))
+
+        if vc > best_vc:
+            best_vc = vc
+            consecutive_stable = 0
+            rprint(f"  probe {probe_count}/{probes}: gsf={gsf_prefix}... {vs} ({vc}) [bold green]↑ new max[/bold green]")
+        else:
+            consecutive_stable += 1
+            rprint(f"  probe {probe_count}/{probes}: gsf={gsf_prefix}... {vs} ({vc}) [dim](stable {consecutive_stable}/{stable})[/dim]")
+
+        if consecutive_stable >= stable:
+            rprint(f"[dim]  Converged: max stable for {stable} consecutive probes.[/dim]")
+            break
+
+        time.sleep(1.5)
+
+    if not results:
+        err.print("[red]Could not fetch version from any probe.[/red]")
+        raise typer.Exit(code=1)
+
+    results.sort(key=lambda x: x[2], reverse=True)
+    _, best_version, best_vc_final = results[0]
+
+    table = Table(title=f"Probe Results: {package}", show_header=True)
+    table.add_column("GSF prefix", style="dim")
+    table.add_column("Version")
+    table.add_column("Version Code", justify="right")
+    for gsf, vs, vc in results:
+        style = "bold green" if vc == best_vc_final else ""
+        table.add_row(gsf + "...", vs, str(vc), style=style)
+    console.print(table)
+
+    rprint(f"\n[bold green]Latest:[/bold green] {best_version} ({best_vc_final})" +
+           (f"  [dim]Region: {country.upper()}[/dim]" if country else ""))
 
 
 # ── info ────────────────────────────────────────────────────────────────────
@@ -101,17 +232,24 @@ def info(
     package: str = typer.Argument(..., help="Package name (e.g. com.whatsapp)."),
     arch: str = typer.Option("arm64", help="Architecture for token."),
     dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
+    country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code (e.g. US, IN, DE). Sets gl= and locale headers. For true regional versions, combine with --proxy."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for FDFE calls, e.g. socks5://host:port or http://host:port. Routes requests through a regional IP."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring (e.g. 'D2' or 'samsung'). Run 'gplaydl profiles' to list all."),
 ) -> None:
-    """Show app details from Google Play."""
-    auth_data = _require_auth(arch, dispenser)
+    """Show app details from Google Play.
+
+    Use --country to set region headers, and --proxy to route through a
+    regional IP (required for apps with region-specific version tracks).
+    """
+    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
 
     with console.status(f"Fetching details for [bold]{package}[/bold]..."):
         try:
             try:
-                details = get_details(package, auth_data)
+                details = get_details(package, auth_data, country=country, proxy=proxy)
             except AuthExpiredError:
-                auth_data = _require_auth(arch, dispenser, force=True)
-                details = get_details(package, auth_data)
+                auth_data = _require_auth(arch, dispenser, force=True, country=country, proxy=proxy, profile=profile)
+                details = get_details(package, auth_data, country=country, proxy=proxy)
         except PlayAPIError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
@@ -121,6 +259,9 @@ def info(
     table.add_column("Value")
     table.add_row("Package", details.package)
     table.add_row("Version", f"{details.version_string} ({details.version_code})")
+    if country:
+        table.add_row("Region", country.upper())
+    table.add_row("Device", _device_label(auth_data))
     table.add_row("Developer", details.developer or "N/A")
     table.add_row("Rating", details.rating or "N/A")
     table.add_row("Downloads", details.downloads or "N/A")
@@ -137,17 +278,20 @@ def search(
     limit: int = typer.Option(10, "--limit", "-l", help="Max results."),
     arch: str = typer.Option("arm64", help="Architecture for token."),
     dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
+    country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code for regional search results."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for FDFE calls."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring."),
 ) -> None:
     """Search for apps on Google Play."""
-    auth_data = _require_auth(arch, dispenser)
+    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
 
     with console.status(f"Searching for [bold]{query}[/bold]..."):
         try:
             try:
-                results = search_apps(query, auth_data, limit=limit)
+                results = search_apps(query, auth_data, limit=limit, country=country, proxy=proxy)
             except AuthExpiredError:
-                auth_data = _require_auth(arch, dispenser, force=True)
-                results = search_apps(query, auth_data, limit=limit)
+                auth_data = _require_auth(arch, dispenser, force=True, country=country, proxy=proxy, profile=profile)
+                results = search_apps(query, auth_data, limit=limit, country=country, proxy=proxy)
         except PlayAPIError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
@@ -209,32 +353,49 @@ def download(
     package: str = typer.Argument(..., help="Package name (e.g. com.whatsapp)."),
     output: Path = typer.Option(".", "--output", "-o", help="Output directory."),
     arch: str = typer.Option("arm64", "--arch", "-a", help="Architecture: arm64 or armv7."),
-    version: Optional[int] = typer.Option(None, "--version", "-v", help="Specific version code."),
+    version: Optional[str] = typer.Option(None, "--version", "-v", help="Version code (e.g. 384009971) or version string (e.g. 434.0.0.44.74)."),
     dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
     no_splits: bool = typer.Option(False, "--no-splits", help="Skip downloading split APKs."),
     no_extras: bool = typer.Option(False, "--no-extras", help="Skip downloading additional files (OBB, asset packs)."),
+    country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code (e.g. IN, US). Use with --proxy for true regional APK variants."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for FDFE calls, e.g. socks5://host:port."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring."),
 ) -> None:
     """Download an APK (with splits + additional files) from Google Play."""
-    auth_data = _require_auth(arch, dispenser)
+    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
     output.mkdir(parents=True, exist_ok=True)
+
+    # ── resolve --version to an int version code ─────────────────────────
+    resolved_vc: Optional[int] = None
+    if version is not None:
+        if version.isdigit():
+            resolved_vc = int(version)
+        else:
+            try:
+                resolved_vc, auth_data = _resolve_version_string(
+                    package, version, arch, dispenser, country, proxy, profile
+                )
+            except PlayAPIError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1)
 
     # ── details + purchase + delivery (with auto-retry on expired token) ─
     try:
         try:
             with console.status(f"Fetching details for [bold]{package}[/bold]..."):
-                details = get_details(package, auth_data)
-            vc = version or details.version_code
+                details = get_details(package, auth_data, country=country, proxy=proxy)
+            vc = resolved_vc if resolved_vc is not None else details.version_code
             with console.status("Acquiring app and fetching download URLs..."):
-                purchase(package, vc, auth_data)
-                delivery = get_delivery(package, vc, auth_data)
+                purchase(package, vc, auth_data, country=country, proxy=proxy)
+                delivery = get_delivery(package, vc, auth_data, country=country, proxy=proxy)
         except AuthExpiredError:
-            auth_data = _require_auth(arch, dispenser, force=True)
+            auth_data = _require_auth(arch, dispenser, force=True, country=country, proxy=proxy, profile=profile)
             with console.status(f"Fetching details for [bold]{package}[/bold]..."):
-                details = get_details(package, auth_data)
-            vc = version or details.version_code
+                details = get_details(package, auth_data, country=country, proxy=proxy)
+            vc = resolved_vc if resolved_vc is not None else details.version_code
             with console.status("Acquiring app and fetching download URLs..."):
-                purchase(package, vc, auth_data)
-                delivery = get_delivery(package, vc, auth_data)
+                purchase(package, vc, auth_data, country=country, proxy=proxy)
+                delivery = get_delivery(package, vc, auth_data, country=country, proxy=proxy)
     except PlayAPIError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
@@ -315,9 +476,21 @@ def download(
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
-def _require_auth(arch: str, dispenser: Optional[str], *, force: bool = False) -> dict:
+def _device_label(auth_data: dict) -> str:
+    if auth_data.get("_device_profile"):
+        return auth_data["_device_profile"]
+    ua = auth_data.get("deviceInfoProvider", {}).get("userAgentString", "")
+    m = re.search(r"model=([^,)]+)", ua)
+    return m.group(1).replace("%20", " ") if m else "N/A"
+
+
+def _require_auth(
+    arch: str, dispenser: Optional[str], *,
+    force: bool = False, proxy: Optional[str] = None,
+    country: Optional[str] = None, profile: Optional[str] = None,
+) -> dict:
     """Return auth dict or exit with a helpful error."""
-    data = ensure_auth(arch=arch, dispenser_url=dispenser, force_refresh=force)
+    data = ensure_auth(arch=arch, dispenser_url=dispenser, force_refresh=force, proxy=proxy, country=country, profile=profile)
     if not data:
         err.print(
             "[red]Could not obtain an auth token. "
@@ -325,6 +498,46 @@ def _require_auth(arch: str, dispenser: Optional[str], *, force: bool = False) -
         )
         raise typer.Exit(code=1)
     return data
+
+
+def _resolve_version_string(
+    package: str,
+    version_str: str,
+    arch: str,
+    dispenser: Optional[str],
+    country: Optional[str],
+    proxy: Optional[str],
+    profile: Optional[str],
+) -> tuple[int, dict]:
+    """Probe fresh tokens until one sees the requested version string.
+
+    Returns (version_code, auth_data_for_that_cohort). The caller must use
+    the returned auth for the subsequent purchase/delivery flow so the cohort
+    stays consistent.
+    Raises PlayAPIError if not found within 20 probes.
+    """
+    rprint(f"[dim]Resolving [bold]{version_str}[/bold] — probing fresh tokens...[/dim]")
+    for attempt in range(1, 21):
+        token = fetch_token(arch=arch, profile=profile, dispenser_url=dispenser)
+        if token is None:
+            err.print(f"[yellow]  attempt {attempt}: rate-limited, sleeping 5s...[/yellow]")
+            time.sleep(5)
+            continue
+        try:
+            details = get_details(package, token, country=country, proxy=proxy)
+        except PlayAPIError as exc:
+            err.print(f"[dim]  attempt {attempt}: {exc}[/dim]")
+            time.sleep(1)
+            continue
+        if details.version_string == version_str:
+            rprint(f"[green]  Found {version_str} → vc={details.version_code} (attempt {attempt})[/green]")
+            return details.version_code, token
+        err.print(f"[dim]  attempt {attempt}: got {details.version_string}, want {version_str}[/dim]")
+        time.sleep(1)
+    raise PlayAPIError(
+        f"Version string '{version_str}' not found in 20 probes — "
+        "it may not be in active rollout for any fresh GSF ID."
+    )
 
 
 def _fmt(size_bytes: int | float) -> str:

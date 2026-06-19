@@ -5,6 +5,7 @@ Profiles are rotated during token acquisition for reliability.
 """
 
 from pathlib import Path
+from typing import Optional
 
 PROFILES_DIR = Path(__file__).resolve().parent / "profiles"
 
@@ -80,6 +81,35 @@ FALLBACK_PROFILE = {
     ),
 }
 
+# MCC (Mobile Country Code) + MNC for major markets used to register a
+# device token as belonging to a specific country via the dispenser.
+COUNTRY_MCC: dict[str, tuple[str, str]] = {
+    "US": ("310", "38"),   "IN": ("404", "20"),   "GB": ("234", "30"),
+    "DE": ("262", "01"),   "JP": ("440", "10"),   "CN": ("460", "00"),
+    "BR": ("724", "05"),   "KR": ("450", "05"),   "FR": ("208", "01"),
+    "AU": ("505", "01"),   "CA": ("302", "720"),  "RU": ("250", "01"),
+    "MX": ("334", "020"),  "ID": ("510", "01"),   "TR": ("286", "01"),
+    "SA": ("420", "01"),   "IT": ("222", "01"),   "ES": ("214", "01"),
+    "TH": ("520", "01"),   "VN": ("452", "01"),   "MY": ("502", "12"),
+    "PH": ("515", "02"),   "ZA": ("655", "01"),   "PK": ("410", "01"),
+    "TW": ("466", "92"),   "SG": ("525", "05"),   "NZ": ("530", "24"),
+    "SE": ("240", "01"),   "NO": ("242", "01"),   "NL": ("204", "04"),
+    "PL": ("260", "01"),   "PT": ("268", "01"),   "CH": ("228", "01"),
+    "AT": ("232", "01"),   "BE": ("206", "01"),   "IE": ("272", "01"),
+    "GR": ("202", "01"),   "AR": ("722", "310"),  "EG": ("602", "01"),
+    "NG": ("621", "30"),   "BD": ("470", "01"),   "HK": ("454", "00"),
+}
+
+
+def patch_profile_country(profile: dict, country: str) -> dict:
+    """Return a copy of profile with CellOperator/SimOperator set for country."""
+    cc = country.upper()
+    if cc not in COUNTRY_MCC:
+        return profile
+    mcc, mnc = COUNTRY_MCC[cc]
+    return {**profile, "CellOperator": mcc, "SimOperator": mnc}
+
+
 # Tested priority order — profiles that work best with Aurora dispenser and
 # restricted apps (banking apps like Chase). Pixel 9a first for arm64.
 _PRIORITY_ARM64 = ["Pv", "D2", "eV", "iq", "Fj", "HE", "VP", "Hb", "p6", "B1"]
@@ -130,6 +160,38 @@ ARM64_PROFILES: list[tuple[str, dict]] = [
 ARMV7_PROFILES: list[tuple[str, dict]] = [
     (k, d["profile"]) for k, d in _ALL.items() if d["arch"] == "armv7"
 ]
+
+
+def find_profile(name: str, arch: str = "arm64") -> Optional[tuple[str, dict]]:
+    """Find a profile by exact key or case-insensitive substring of UserReadableName."""
+    pool = ARM64_PROFILES if arch != "armv7" else ARMV7_PROFILES
+    # exact key match first
+    for key, profile in pool:
+        if key == name:
+            return key, profile
+    # substring match on human name
+    needle = name.lower()
+    for key, profile in pool:
+        if needle in profile.get("UserReadableName", "").lower():
+            return key, profile
+    return None
+
+
+def get_latest_probe_profiles(arch: str = "arm64", n: int = 2) -> list[tuple[str, dict]]:
+    """Return the n profiles most likely to see the latest staged rollout.
+
+    Ranked by newest Android SDK + newest Play Store (Vending) version,
+    since Google tends to roll out to newer OS/store versions first.
+    """
+    pool = ARM64_PROFILES if arch != "armv7" else ARMV7_PROFILES
+
+    def _rank(item: tuple[str, dict]) -> tuple[int, int]:
+        _, p = item
+        sdk = int(p.get("Build.VERSION.SDK_INT", "0"))
+        vending = int(p.get("Vending.version", "0"))
+        return (sdk, vending)
+
+    return sorted(pool, key=_rank, reverse=True)[:n]
 
 
 def get_priority_profiles(arch: str = "arm64") -> list[tuple[str, dict]]:

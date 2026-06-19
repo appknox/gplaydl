@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,7 +11,7 @@ from typing import Optional
 import httpx
 from rich.console import Console
 
-from gplaydl.profiles import FALLBACK_PROFILE, get_priority_profiles
+from gplaydl.profiles import FALLBACK_PROFILE, find_profile, get_priority_profiles, patch_profile_country
 
 DEFAULT_DISPENSER_URL = "https://auroraoss.com/api/auth"
 
@@ -19,22 +20,28 @@ _CONFIG_DIR = Path.home() / ".config" / "gplaydl"
 console = Console(stderr=True)
 
 
-def _auth_path(arch: str) -> Path:
-    return _CONFIG_DIR / f"auth-{arch}.json"
+def _sanitize_country(country: str) -> str:
+    """Strip everything except uppercase A-Z and digits — prevents path traversal."""
+    return re.sub(r"[^A-Z0-9]", "", country.upper())[:4]
 
 
-def save_auth(data: dict, arch: str = "arm64") -> Path:
+def _auth_path(arch: str, country: Optional[str] = None) -> Path:
+    suffix = f"-{_sanitize_country(country)}" if country else ""
+    return _CONFIG_DIR / f"auth-{arch}{suffix}.json"
+
+
+def save_auth(data: dict, arch: str = "arm64", country: Optional[str] = None) -> Path:
     """Persist auth data to disk and return the file path."""
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     data["_cached_at"] = time.time()
-    path = _auth_path(arch)
+    path = _auth_path(arch, country)
     path.write_text(json.dumps(data, indent=2))
     return path
 
 
-def load_cached_auth(arch: str = "arm64") -> Optional[dict]:
+def load_cached_auth(arch: str = "arm64", country: Optional[str] = None) -> Optional[dict]:
     """Return cached auth dict or None."""
-    path = _auth_path(arch)
+    path = _auth_path(arch, country)
     if not path.exists():
         return None
     try:
@@ -53,10 +60,15 @@ def clear_auth() -> None:
 def fetch_token(
     dispenser_url: Optional[str] = None,
     arch: str = "arm64",
+    proxy: Optional[str] = None,
+    country: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> Optional[dict]:
     """Obtain an anonymous auth token from the dispenser.
 
     Rotates through device profiles until one yields an authToken.
+    When *country* is set, patches each profile's CellOperator/SimOperator
+    with the matching MCC/MNC so the GSF registration is tied to that region.
     Returns the full auth dict on success, None on failure.
     """
     url = dispenser_url or DEFAULT_DISPENSER_URL
@@ -65,18 +77,25 @@ def fetch_token(
         "Content-Type": "application/json",
     }
 
-    profiles = get_priority_profiles(arch)
-    if not profiles:
-        profiles = [("fallback", FALLBACK_PROFILE)]
+    if profile:
+        match = find_profile(profile, arch)
+        if not match:
+            console.print(f"[red]Profile not found: {profile}[/red]")
+            return None
+        profiles = [match]
+    else:
+        profiles = get_priority_profiles(arch) or [("fallback", FALLBACK_PROFILE)]
 
     for profile_name, profile in profiles:
         device = profile.get("UserReadableName", profile_name)
+        payload = patch_profile_country(profile, country) if country else profile
         try:
-            resp = httpx.post(url, json=profile, headers=headers, timeout=30)
+            resp = httpx.post(url, json=payload, headers=headers, timeout=30, proxy=proxy)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("authToken"):
                     console.print(f"  Authenticated with profile: [bold]{device}[/bold]")
+                    data["_device_profile"] = device
                     return data
         except Exception:
             continue
@@ -91,14 +110,18 @@ def ensure_auth(
     arch: str = "arm64",
     dispenser_url: Optional[str] = None,
     force_refresh: bool = False,
+    proxy: Optional[str] = None,
+    country: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> Optional[dict]:
     """Return cached auth or fetch a new token transparently.
 
+    Each country gets its own cache file so tokens stay region-bound.
     Proactively refreshes tokens older than 50 minutes.
     Pass *force_refresh=True* to ignore cache entirely (e.g. after a 401).
     """
     if not force_refresh:
-        cached = load_cached_auth(arch)
+        cached = load_cached_auth(arch, country)
         if cached and cached.get("authToken"):
             age = time.time() - cached.get("_cached_at", 0)
             if age < _MAX_TOKEN_AGE:
@@ -107,16 +130,30 @@ def ensure_auth(
     else:
         console.print("[dim]Refreshing token...[/dim]")
 
-    data = fetch_token(dispenser_url=dispenser_url, arch=arch)
+    data = fetch_token(dispenser_url=dispenser_url, arch=arch, proxy=proxy, country=country, profile=profile)
     if data:
-        save_auth(data, arch)
+        save_auth(data, arch, country)
     return data
 
 
-def build_headers(auth: dict) -> dict[str, str]:
+_COUNTRY_LOCALE: dict[str, str] = {
+    "CN": "zh_CN", "TW": "zh_TW", "HK": "zh_HK",
+    "JP": "ja_JP", "KR": "ko_KR",
+    "RU": "ru_RU", "DE": "de_DE", "FR": "fr_FR",
+    "ES": "es_ES", "IT": "it_IT", "PT": "pt_BR",
+    "BR": "pt_BR", "AR": "es_AR", "MX": "es_MX",
+    "SA": "ar_SA", "TR": "tr_TR", "PL": "pl_PL",
+    "NL": "nl_NL", "SE": "sv_SE", "NO": "nb_NO",
+    "TH": "th_TH", "VN": "vi_VN", "ID": "in_ID",
+}
+
+
+def build_headers(auth: dict, country: Optional[str] = None) -> dict[str, str]:
     """Construct HTTP headers for Google Play FDFE requests."""
     device_info = auth.get("deviceInfoProvider", {})
-    locale = "en_US"
+    cc = country.upper() if country else None
+    # ponytail: default en_XX for unknown countries, specific mapping for known ones
+    locale = _COUNTRY_LOCALE.get(cc, f"en_{cc}") if cc else "en_US"
 
     headers = {
         "Authorization": f"Bearer {auth['authToken']}",
@@ -131,7 +168,7 @@ def build_headers(auth: dict) -> dict[str, str]:
             ),
         ),
         "X-DFE-Device-Id": auth.get("gsfId", ""),
-        "Accept-Language": "en-US",
+        "Accept-Language": locale.replace("_", "-"),
         "X-DFE-Encoded-Targets": (
             "CAESN/qigQYC2AMBFfUbyA7SM5Ij/CvfBoIDgxXrBPsDlQUdMfOLAfoFrwEH"
             "gAcBrQYhoA0cGt4MKK0Y2gI"
