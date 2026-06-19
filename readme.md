@@ -2,7 +2,7 @@
 
 Download APKs from Google Play Store using anonymous authentication. Downloads base APKs, split APKs (App Bundles), OBB expansion files, and Play Asset Delivery packs — all by default.
 
-> **v2.0 — Complete Rewrite.** Ground-up rewrite with a new CLI, pure-Python protobuf decoding (no `gpapi` dependency), and automatic token management. Looking for v1.x? See the [`master`](https://github.com/appknox/gplaydl/tree/master) branch.
+> **v2.0 — Complete Rewrite.** Ground-up rewrite with a new CLI, pure-Python protobuf decoding (no `gpapi` dependency), and automatic token management.
 
 ## Features
 
@@ -16,31 +16,60 @@ Download APKs from Google Play Store using anonymous authentication. Downloads b
 - Search and browse app details from the command line
 - Find the latest available version by sampling multiple fresh GSF IDs
 
-## Installation
+## Deployment / Integration
 
-**Requirements:** Python 3.9+
+For servers, Docker images, or any environment that uses `pip` directly:
 
 ```bash
-pip install gplaydl
+pip install git+https://github.com/appknox/gplaydl.git
 ```
 
-### Install from source
+In a **Dockerfile**:
+
+```dockerfile
+RUN pip3 install git+https://github.com/appknox/gplaydl.git
+```
+
+To pin to a specific release tag or commit (recommended for production):
+
+```dockerfile
+RUN pip3 install git+https://github.com/appknox/gplaydl.git@v2.0.0
+# or by commit SHA:
+RUN pip3 install git+https://github.com/appknox/gplaydl.git@46d0b1f
+```
+
+In a **`requirements.txt`**:
+
+```
+git+https://github.com/appknox/gplaydl.git
+```
+
+---
+
+## Installation
+
+**Requirements:** Python 3.9+, [uv](https://github.com/astral-sh/uv)
+
+This package is not published to PyPI. Install directly from source:
 
 ```bash
 git clone https://github.com/appknox/gplaydl.git
 cd gplaydl
-pip install .
+uv sync
+uv pip install .
 ```
 
 ## Quick Start
 
 ```bash
 # 1. Get an auth token (automatic, anonymous)
-gplaydl auth
+uv run gplaydl auth
 
-# 2. Download an app (base APK + splits + OBB/asset packs)
-gplaydl download com.whatsapp
+# 2. Download an app (base APK only)
+uv run gplaydl download com.whatsapp
 ```
+
+All commands below use `uv run gplaydl ...`. If you activate the virtual environment (`source .venv/bin/activate`) you can drop the `uv run` prefix.
 
 ## Commands
 
@@ -210,11 +239,13 @@ gplaydl profiles --arch armv7   # ARMv7 only
 
 Use the **Key** column value with `--profile` in any command.
 
-## Running without installing
+## Running without installing globally
+
+After `uv sync`, you can also invoke via the module directly:
 
 ```bash
-python -m gplaydl auth
-python -m gplaydl download com.whatsapp
+uv run python -m gplaydl auth
+uv run python -m gplaydl download com.whatsapp
 ```
 
 ## How It Works
