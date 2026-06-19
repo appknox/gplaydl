@@ -142,6 +142,7 @@ def latest(
     probes: int = typer.Option(10, "--probes", "-n", help="Max fresh GSF IDs to sample (default 10)."),
     stable: int = typer.Option(3, "--stable", "-s", help="Stop early when max version unchanged for this many consecutive probes (default 3)."),
     profile: Optional[str] = typer.Option(None, "--profile", help="Device profile for all probes (e.g. 'Galaxy S25 Ultra'). Defaults to top-ranked."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for dispenser + FDFE calls, e.g. socks5://host:port."),
 ) -> None:
     """Find the latest available version by probing multiple fresh GSF IDs."""
     if profile:
@@ -167,7 +168,7 @@ def latest(
     probe_count = 0
 
     while probe_count < probes:
-        auth = fetch_token(arch=arch, profile=profile_key, dispenser_url=dispenser)
+        auth = fetch_token(arch=arch, profile=profile_key, dispenser_url=dispenser, proxy=proxy)
         if auth is None:
             jitter = backoff * 0.2 * (2 * random.random() - 1)
             wait = min(backoff + jitter, 120.0)
@@ -181,7 +182,7 @@ def latest(
         gsf_prefix = str(auth.get("gsfId", "?"))[:8]
 
         try:
-            details = get_details(package, auth, country=country)
+            details = get_details(package, auth, country=country, proxy=proxy)
         except PlayAPIError as exc:
             err.print(f"[dim]  probe {probe_count}: {gsf_prefix}... error: {exc}[/dim]")
             continue
