@@ -104,16 +104,15 @@ Probes multiple fresh GSF IDs (Google Services Framework IDs) from the token dis
 
 ```bash
 gplaydl latest com.instagram.android
-gplaydl latest com.instagram.android --probes 20 --stable 5
+gplaydl latest com.instagram.android --stable 5
 gplaydl latest com.instagram.android --profile "Galaxy S25 Ultra"
 gplaydl latest com.instagram.android --country IN
 gplaydl latest com.instagram.android --proxy socks5://host:1080
-gplaydl latest com.instagram.android -n 15 -s 4 -c US -p socks5://host:1080
+gplaydl latest com.instagram.android -s 4 -c US -p socks5://host:1080
 ```
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--probes` | `-n` | `10` | Maximum number of fresh GSF IDs to sample |
 | `--stable` | `-s` | `3` | Stop early when the highest version code is unchanged for this many consecutive probes |
 | `--profile` | | top-ranked | Device profile for all probes (e.g. `Galaxy S25 Ultra`). Defaults to the highest SDK + Vending version profile |
 | `--country` | `-c` | — | 2-letter country code sent with FDFE requests |
@@ -121,7 +120,9 @@ gplaydl latest com.instagram.android -n 15 -s 4 -c US -p socks5://host:1080
 | `--proxy` | `-p` | — | Proxy URL for dispenser + FDFE calls (e.g. `socks5://host:port`) |
 | `--arch` | | `arm64` | Architecture for token acquisition |
 
-**How convergence works:** After each probe, if the best version code seen so far hasn't increased for `--stable` consecutive probes, the command stops early. This avoids unnecessary dispenser calls once the result has stabilised. Rate-limit responses trigger exponential backoff (8s → 16s → 32s → 120s cap) and do not count against `--probes`.
+**How the pool works:** The tool maintains a regional pool of 5 GSF ID / token pairs on disk (`~/.config/gplaydl/token-pool-{arch}-{country}.json`). Before every `latest` or `download` call, it checks how many valid (unexpired) tokens exist in that region's pool and fetches only the deficit from Aurora's dispenser — so if the pool is already full, zero dispenser calls are made. Tokens are valid for 50 minutes. If a token dies mid-request (HTTP 401), it is automatically replaced in the pool.
+
+**How convergence works:** After each probe, if the best version code seen so far hasn't increased for `--stable` consecutive probes, the command stops early.
 
 **Output:** A table with each probe's GSF ID prefix, version string, and version code. The highest version code is highlighted and printed as the final result with its version code.
 

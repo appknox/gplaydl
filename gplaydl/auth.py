@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from urllib.parse import urlparse
 from rich.console import Console
 
 from gplaydl.profiles import FALLBACK_PROFILE, find_profile, get_priority_profiles, patch_profile_country
@@ -57,6 +58,19 @@ def clear_auth() -> None:
             f.unlink(missing_ok=True)
 
 
+def _build_httpx_proxy(proxy: Optional[str | httpx.Proxy]) -> Optional[httpx.Proxy]:
+    """Build an httpx.Proxy with explicit auth to avoid 407 on some servers."""
+    if not proxy:
+        return None
+    if isinstance(proxy, httpx.Proxy):
+        return proxy
+    parsed = urlparse(proxy)
+    if parsed.username and parsed.password:
+        clean_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        return httpx.Proxy(url=clean_url, auth=(parsed.username, parsed.password))
+    return httpx.Proxy(url=proxy)
+
+
 def fetch_token(
     dispenser_url: Optional[str] = None,
     arch: str = "arm64",
@@ -90,20 +104,114 @@ def fetch_token(
         device = profile.get("UserReadableName", profile_name)
         payload = patch_profile_country(profile, country) if country else profile
         try:
-            resp = httpx.post(url, json=payload, headers=headers, timeout=30, proxy=proxy)
+            httpx_proxy = _build_httpx_proxy(proxy)
+            resp = httpx.post(url, json=payload, headers=headers, timeout=30, proxy=httpx_proxy)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("authToken"):
                     console.print(f"  Authenticated with profile: [bold]{device}[/bold]")
                     data["_device_profile"] = device
                     return data
-        except Exception:
+                console.print(f"  [yellow]No authToken in response for {device}: {data}[/yellow]")
+            else:
+                console.print(f"  [yellow]Dispenser returned HTTP {resp.status_code} for {device}[/yellow]")
+        except Exception as exc:
+            console.print(f"  [red]Dispenser request failed for {device}: {exc}[/red]")
             continue
 
     return None
 
 
 _MAX_TOKEN_AGE = 50 * 60  # 50 minutes — refresh before the ~1h Google expiry
+
+# ── token pool ────────────────────────────────────────────────────────────────
+
+# Number of GSF ID / token pairs maintained per region. Enough to detect
+# staged-rollout version differences while staying well under Aurora's ~20
+# requests/hour rate limit.
+DEFAULT_PROBES = 5
+
+
+def _pool_path(arch: str, country: Optional[str]) -> Path:
+    suffix = f"-{_sanitize_country(country)}" if country else ""
+    return _CONFIG_DIR / f"token-pool-{arch}{suffix}.json"
+
+
+def _load_pool(arch: str, country: Optional[str]) -> list[dict]:
+    """Return unexpired tokens from the on-disk pool for this arch+country."""
+    try:
+        tokens: list[dict] = json.loads(_pool_path(arch, country).read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    now = time.time()
+    return [t for t in tokens if now - t.get("_cached_at", 0) < _MAX_TOKEN_AGE]
+
+
+def _save_pool(tokens: list[dict], arch: str, country: Optional[str]) -> None:
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _pool_path(arch, country).write_text(json.dumps(tokens))
+
+
+def ensure_pool(
+    arch: str = "arm64",
+    country: Optional[str] = None,
+    proxy: Optional[str] = None,
+    dispenser_url: Optional[str] = None,
+    profile: Optional[str] = None,
+    size: int = DEFAULT_PROBES,
+) -> list[dict]:
+    """Ensure the regional pool has exactly *size* valid tokens.
+
+    Only hits the Aurora dispenser for the deficit — if the pool already has
+    *size* unexpired tokens, no network call is made at all.
+    Returns the full list of valid tokens (may be fewer than *size* if the
+    dispenser is rate-limiting).
+    """
+    pool = _load_pool(arch, country)
+    deficit = size - len(pool)
+    if deficit > 0:
+        label = country or "default"
+        console.print(
+            f"[dim]  Pool [{label}]: {len(pool)}/{size} valid — fetching {deficit} more...[/dim]"
+        )
+        for _ in range(deficit):
+            t = fetch_token(
+                dispenser_url=dispenser_url, arch=arch,
+                proxy=proxy, profile=profile, country=country,
+            )
+            if t is None:
+                break
+            t.setdefault("_cached_at", time.time())
+            pool.append(t)
+        _save_pool(pool, arch, country)
+    return pool
+
+
+def replace_pool_token(
+    failed_token: dict,
+    arch: str = "arm64",
+    country: Optional[str] = None,
+    proxy: Optional[str] = None,
+    dispenser_url: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> Optional[dict]:
+    """Remove *failed_token* from the pool and replace it with a fresh one.
+
+    Called when a mid-request AuthExpiredError reveals a token died early.
+    Returns the new token, or None if the dispenser is unavailable.
+    """
+    pool = _load_pool(arch, country)
+    failed_gsf = failed_token.get("gsfId")
+    pool = [t for t in pool if t.get("gsfId") != failed_gsf]
+    new_token = fetch_token(
+        dispenser_url=dispenser_url, arch=arch,
+        proxy=proxy, profile=profile, country=country,
+    )
+    if new_token:
+        new_token["_cached_at"] = time.time()
+        pool.append(new_token)
+    _save_pool(pool, arch, country)
+    return new_token
 
 
 def ensure_auth(

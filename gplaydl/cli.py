@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 import re
 import time
 from pathlib import Path
@@ -26,8 +25,10 @@ from gplaydl.api import (
 )
 from gplaydl.auth import (
     clear_auth,
+    DEFAULT_PROBES,
     ensure_auth,
-    fetch_token,
+    ensure_pool,
+    replace_pool_token,
     save_auth,
 )
 from gplaydl.profiles import ARM64_PROFILES, ARMV7_PROFILES, find_profile, get_latest_probe_profiles
@@ -139,12 +140,11 @@ def latest(
     arch: str = typer.Option("arm64", help="Architecture for token."),
     country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code."),
     dispenser: Optional[str] = typer.Option(None, "--dispenser", "-d", help="Custom dispenser URL."),
-    probes: int = typer.Option(10, "--probes", "-n", help="Max fresh GSF IDs to sample (default 10)."),
     stable: int = typer.Option(3, "--stable", "-s", help="Stop early when max version unchanged for this many consecutive probes (default 3)."),
     profile: Optional[str] = typer.Option(None, "--profile", help="Device profile for all probes (e.g. 'Galaxy S25 Ultra'). Defaults to top-ranked."),
     proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for dispenser + FDFE calls, e.g. socks5://host:port."),
 ) -> None:
-    """Find the latest available version by probing multiple fresh GSF IDs."""
+    """Find the latest available version by probing the regional GSF ID pool."""
     if profile:
         found = find_profile(profile, arch)
         if not found:
@@ -159,32 +159,42 @@ def latest(
         profile_key, profile_data = top[0]
 
     device_name = profile_data.get("UserReadableName", profile_key)
-    rprint(f"[dim]Profile:[/dim] {device_name}  [dim]Max probes:[/dim] {probes}  [dim]Stable threshold:[/dim] {stable}")
+    rprint(f"[dim]Profile:[/dim] {device_name}  [dim]Pool size:[/dim] {DEFAULT_PROBES}  [dim]Stable threshold:[/dim] {stable}")
 
-    results: list[tuple[str, str, int]] = []  # (gsf_prefix, version_string, version_code)
+    # Ensure regional pool has DEFAULT_PROBES tokens — only hits dispenser for deficit
+    tokens = ensure_pool(
+        arch=arch, country=country, proxy=proxy,
+        dispenser_url=dispenser, profile=profile_key,
+    )
+    if not tokens:
+        err.print("[red]Could not obtain any tokens — dispenser may be rate-limiting.[/red]")
+        raise typer.Exit(code=1)
+
+    results: list[tuple[str, str, int]] = []
     best_vc = 0
     consecutive_stable = 0
-    backoff = 8.0
-    probe_count = 0
 
-    while probe_count < probes:
-        auth = fetch_token(arch=arch, profile=profile_key, dispenser_url=dispenser, proxy=proxy)
-        if auth is None:
-            jitter = backoff * 0.2 * (2 * random.random() - 1)
-            wait = min(backoff + jitter, 120.0)
-            err.print(f"[yellow]  Rate-limited — waiting {wait:.1f}s before retry...[/yellow]")
-            time.sleep(wait)
-            backoff = min(backoff * 2, 120.0)
-            continue
-
-        backoff = 8.0
-        probe_count += 1
-        gsf_prefix = str(auth.get("gsfId", "?"))[:8]
-
+    for i, token in enumerate(tokens):
+        gsf_prefix = str(token.get("gsfId", "?"))[:8]
         try:
-            details = get_details(package, auth, country=country, proxy=proxy)
+            details = get_details(package, token, country=country, proxy=proxy)
+        except AuthExpiredError:
+            err.print(f"[dim]  probe {i+1}: {gsf_prefix}... token expired — replacing[/dim]")
+            new_token = replace_pool_token(
+                token, arch=arch, country=country, proxy=proxy,
+                dispenser_url=dispenser, profile=profile_key,
+            )
+            if new_token is None:
+                err.print(f"[dim]  probe {i+1}: replacement unavailable, skipping[/dim]")
+                continue
+            tokens[i] = new_token
+            try:
+                details = get_details(package, new_token, country=country, proxy=proxy)
+            except PlayAPIError as exc:
+                err.print(f"[dim]  probe {i+1}: retry failed: {exc}[/dim]")
+                continue
         except PlayAPIError as exc:
-            err.print(f"[dim]  probe {probe_count}: {gsf_prefix}... error: {exc}[/dim]")
+            err.print(f"[dim]  probe {i+1}: {gsf_prefix}... error: {exc}[/dim]")
             continue
 
         vc = details.version_code
@@ -194,16 +204,14 @@ def latest(
         if vc > best_vc:
             best_vc = vc
             consecutive_stable = 0
-            rprint(f"  probe {probe_count}/{probes}: gsf={gsf_prefix}... {vs} ({vc}) [bold green]↑ new max[/bold green]")
+            rprint(f"  probe {i+1}/{len(tokens)}: gsf={gsf_prefix}... {vs} ({vc}) [bold green]↑ new max[/bold green]")
         else:
             consecutive_stable += 1
-            rprint(f"  probe {probe_count}/{probes}: gsf={gsf_prefix}... {vs} ({vc}) [dim](stable {consecutive_stable}/{stable})[/dim]")
+            rprint(f"  probe {i+1}/{len(tokens)}: gsf={gsf_prefix}... {vs} ({vc}) [dim](stable {consecutive_stable}/{stable})[/dim]")
 
         if consecutive_stable >= stable:
-            rprint(f"[dim]  Converged: max stable for {stable} consecutive probes.[/dim]")
+            rprint(f"[dim]  Converged after {i+1} probes.[/dim]")
             break
-
-        time.sleep(1.5)
 
     if not results:
         err.print("[red]Could not fetch version from any probe.[/red]")
@@ -363,8 +371,12 @@ def download(
     profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring."),
 ) -> None:
     """Download an APK (with splits + additional files) from Google Play."""
-    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
     output.mkdir(parents=True, exist_ok=True)
+    pool = ensure_pool(arch=arch, country=country, proxy=proxy, dispenser_url=dispenser, profile=profile)
+    if not pool:
+        err.print("[red]Could not obtain an auth token — dispenser may be rate-limiting.[/red]")
+        raise typer.Exit(code=1)
+    auth_data = pool[0]
 
     # ── resolve --version to an int version code ─────────────────────────
     resolved_vc: Optional[int] = None
@@ -390,7 +402,11 @@ def download(
                 purchase(package, vc, auth_data, country=country, proxy=proxy)
                 delivery = get_delivery(package, vc, auth_data, country=country, proxy=proxy)
         except AuthExpiredError:
-            auth_data = _require_auth(arch, dispenser, force=True, country=country, proxy=proxy, profile=profile)
+            new_token = replace_pool_token(auth_data, arch=arch, country=country, proxy=proxy, dispenser_url=dispenser, profile=profile)
+            if not new_token:
+                err.print("[red]Token expired and replacement failed.[/red]")
+                raise typer.Exit(code=1)
+            auth_data = new_token
             with console.status(f"Fetching details for [bold]{package}[/bold]..."):
                 details = get_details(package, auth_data, country=country, proxy=proxy)
             vc = resolved_vc if resolved_vc is not None else details.version_code

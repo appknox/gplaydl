@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from gplaydl.auth import build_headers
+from gplaydl.auth import build_headers, _build_httpx_proxy
 from gplaydl.protobuf import ProtoDecoder, extract_strings
 
 SEARCH_URL = f"https://android.clients.google.com/fdfe/search"
@@ -217,7 +217,7 @@ def _fetch_details_raw(
     url = f"{DETAILS_URL}?doc={package}"
     if country:
         url += f"&gl={country.upper()}"
-    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=_build_httpx_proxy(proxy))
     if resp.status_code == 404:
         raise PlayAPIError(f"App not found: {package}")
     if resp.status_code == 401:
@@ -232,7 +232,7 @@ def get_details(
     country: Optional[str] = None, proxy: Optional[str] = None,
 ) -> AppDetails:
     """Return structured app details."""
-    parsed = _parse_details_proto(_fetch_details_raw(package, auth, country=country, proxy=proxy))
+    parsed = _parse_details_proto(_fetch_details_raw(package, auth, country=country, proxy=_build_httpx_proxy(proxy)))
     if not parsed.docid:
         raise PlayAPIError("App not found or unavailable for this device profile.")
     return AppDetails(
@@ -259,7 +259,7 @@ def purchase(
     headers = build_headers(auth, country=country)
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     body = f"doc={package}&ot=1&vc={version_code}"
-    resp = httpx.post(PURCHASE_URL, headers=headers, content=body, timeout=30, proxy=proxy)
+    resp = httpx.post(PURCHASE_URL, headers=headers, content=body, timeout=30, proxy=_build_httpx_proxy(proxy))
     if resp.status_code not in (200, 204):
         pass  # non-fatal — may already be "purchased"
 
@@ -383,7 +383,7 @@ def get_delivery(
     url = f"{DELIVERY_URL}?doc={package}&ot=1&vc={version_code}"
     if country:
         url += f"&gl={country.upper()}"
-    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=_build_httpx_proxy(proxy))
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:
@@ -413,7 +413,7 @@ def list_splits(
     url = f"{DETAILS_URL}?doc={package}"
     if country:
         url += f"&gl={country.upper()}"
-    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=_build_httpx_proxy(proxy))
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:
@@ -486,7 +486,7 @@ def search_apps(
     url = f"{SEARCH_URL}?q={query}&c=3"
     if country:
         url += f"&gl={country.upper()}"
-    resp = httpx.get(url, headers=headers, timeout=30, proxy=proxy)
+    resp = httpx.get(url, headers=headers, timeout=30, proxy=_build_httpx_proxy(proxy))
     if resp.status_code == 401:
         raise AuthExpiredError("Auth token expired.")
     if resp.status_code != 200:
