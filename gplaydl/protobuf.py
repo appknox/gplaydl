@@ -122,6 +122,42 @@ class ProtoDecoder:
             return b.decode("latin-1", errors="replace")
 
 
+def proto_to_dict(data: bytes) -> dict:
+    """Recursively decode protobuf bytes into a nested dict keyed by field number (str).
+    Length-delimited fields are tried as nested proto first, then UTF-8 string, then base64.
+    Repeated fields become lists."""
+    import base64
+    out: dict = {}
+    try:
+        fields = ProtoDecoder(data).read_all_ordered()
+    except Exception:
+        return {}
+    for fn, wt, v in fields:
+        key = str(fn)
+        if isinstance(v, (bytes, bytearray)):
+            sub = proto_to_dict(v)
+            val: Any = sub if sub else (v.decode("utf-8") if _is_utf8(v) else base64.b64encode(v).decode())
+        else:
+            val = v
+        if key in out:
+            existing = out[key]
+            if isinstance(existing, list):
+                existing.append(val)
+            else:
+                out[key] = [existing, val]
+        else:
+            out[key] = val
+    return out
+
+
+def _is_utf8(b: bytes) -> bool:
+    try:
+        b.decode("utf-8")
+        return True
+    except Exception:
+        return False
+
+
 def extract_strings(data: bytes) -> list[str]:
     """Pull all UTF-8 strings from a protobuf blob (non-recursive, fast)."""
     out: list[str] = []

@@ -10,13 +10,14 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
 
 from gplaydl.auth import build_headers, _build_httpx_proxy
-from gplaydl.protobuf import ProtoDecoder, extract_strings
+from gplaydl.protobuf import ProtoDecoder, extract_strings, proto_to_dict
 
 SEARCH_URL = f"https://android.clients.google.com/fdfe/search"
 
@@ -225,6 +226,150 @@ def _fetch_details_raw(
     if resp.status_code != 200:
         raise PlayAPIError(f"Failed to fetch details (HTTP {resp.status_code}).")
     return resp.content
+
+
+def get_details_raw(
+    package: str, auth: dict,
+    country: Optional[str] = None, proxy: Optional[str] = None,
+) -> dict:
+    """Return the full protobuf response decoded as a nested dict."""
+    raw = _fetch_details_raw(package, auth, country=country, proxy=_build_httpx_proxy(proxy))
+    return proto_to_dict(raw)
+
+
+def fetch_app_item(
+    package: str,
+    arch: str = "arm64",
+    country: Optional[str] = None,
+    proxy: Optional[str] = None,
+    profile: Optional[str] = None,
+    dispenser_url: Optional[str] = None,
+) -> dict:
+    """Fetch, parse and return a PlayStoreAppItem dict in one call.
+
+    Handles token pool management and expired-token retry internally.
+
+    Example::
+
+        from gplaydl.api import fetch_app_item
+        item = fetch_app_item("com.whatsapp", country="US", proxy="http://user:pass@host:port/")
+    """
+    from gplaydl.auth import pick_pool_token, replace_pool_token
+    auth = pick_pool_token(arch=arch, country=country, proxy=proxy,
+                           dispenser_url=dispenser_url, profile=profile)
+    if not auth:
+        raise PlayAPIError("Could not obtain auth token — run: gplaydl auth")
+    try:
+        raw = get_details_raw(package, auth, country=country, proxy=proxy)
+    except AuthExpiredError:
+        replace_pool_token(auth, arch=arch, country=country, proxy=proxy, dispenser_url=dispenser_url)
+        auth = pick_pool_token(arch=arch, country=country, proxy=proxy,
+                               dispenser_url=dispenser_url, profile=profile)
+        if not auth:
+            raise PlayAPIError("Token expired and replacement failed.")
+        raw = get_details_raw(package, auth, country=country, proxy=proxy)
+    return parse_app_item(raw, region=country or "")
+
+
+def parse_app_item(raw: dict, region: str = "") -> dict:
+    """Map proto_to_dict output to PlayStoreAppItem-compatible dict.
+
+    Path reference (field numbers from --raw output):
+      doc  = raw[1][2][4]          DocV2
+      ad   = doc[13][1]            AppDetails
+      rtg  = doc[14]               AggregateRating
+      imgs = doc[10]               image list (type 1=screenshot, 2=feature, 4=icon)
+      cats = doc[66][9][1]         category list
+    """
+    def _g(d: Any, *keys: Any) -> Any:
+        for k in keys:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(str(k))
+        return d
+
+    try:
+        doc = raw["1"]["2"]["4"]
+    except (KeyError, TypeError):
+        return {}
+
+    ad: dict  = _g(doc, 13, 1) or {}
+    rtg: dict = doc.get("14") or {}
+    imgs = doc.get("10") or []
+    if not isinstance(imgs, list):
+        imgs = [imgs]
+
+    pkg = doc.get("1") or doc.get("2", "")
+
+    icon_url         = next((i["5"] for i in imgs if isinstance(i, dict) and i.get("1") == 4  and "5" in i), None)
+    feature_gfx_url  = next((i["5"] for i in imgs if isinstance(i, dict) and i.get("1") == 2  and "5" in i), None)
+    screenshots      = [i["5"] for i in imgs if isinstance(i, dict) and i.get("1") == 1 and "5" in i]
+
+    cats = _g(ad, 66, 9, 1) or []
+    if not isinstance(cats, list):
+        cats = [cats]
+    cat = cats[0] if cats and isinstance(cats[0], dict) else {}
+
+    def _parse_date(s: Any) -> Optional[str]:
+        if not isinstance(s, str):
+            return None
+        try:
+            return datetime.strptime(s, "%b %d, %Y").replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            return s
+
+    def _rating_float(s: Any) -> Optional[float]:
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    # AggregateRating histogram: fields 3–7 are 1★–5★ counts (gpapi proto convention)
+    histogram = {str(star): rtg.get(str(star + 2)) for star in range(1, 6)}
+
+    rating_str = rtg.get("17")  # display string e.g. "4.5"
+
+    # field 70 = precise real-time install count; field 53 = rounded bucket floor
+    exact_downloads = ad.get("70") or ad.get("53")
+    # field 13 = "10,000,000,000+ downloads" → strip suffix for bucket
+    bucket_raw: str = ad.get("13") or ad.get("61") or ""
+    downloads_bucket = bucket_raw.replace(" downloads", "").replace(" installs", "").strip()
+
+    return {
+        "id": f"{pkg}_playstore_{region.lower()}" if region else f"{pkg}_playstore",
+        "package_name": pkg,
+        "app_id": doc.get("2", pkg),
+        "store": "playstore",
+        "region": region.upper() or None,
+        # display
+        "title": doc.get("5"),
+        "description": doc.get("7"),
+        "developer": doc.get("6"),
+        "dev_id": ad.get("1"),
+        "icon_url": icon_url,
+        "feature_graphic_url": feature_gfx_url,
+        "screenshots": screenshots,
+        "url": doc.get("17"),
+        # metrics
+        "rating": _rating_float(rating_str),
+        "rating_count": rtg.get("2"),
+        "rating_display": rating_str,
+        "rating_histogram": histogram,
+        "total_downloads": exact_downloads,
+        "downloads_bucket": downloads_bucket,
+        # app details
+        "version": ad.get("4"),
+        "version_sourced": False,
+        "updated_on": _parse_date(ad.get("16")),
+        "released_on": _parse_date(_g(ad, 64, 1)),
+        "min_os_version": _g(ad, 82, 1, 1),
+        "in_app_purchases": ad.get("67") or "",
+        "content_rating": _g(doc, 50, 1) or "",
+        "category_name": cat.get("1") or "",
+        "category_code": cat.get("3") or "",
+        # rich metadata
+        "permissions": ad.get("10") or [],
+    }
 
 
 def get_details(

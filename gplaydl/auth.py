@@ -187,6 +187,46 @@ def ensure_pool(
     return pool
 
 
+def _index_path(arch: str, country: Optional[str]) -> Path:
+    suffix = f"-{_sanitize_country(country)}" if country else ""
+    return _CONFIG_DIR / f"pool-index-{arch}{suffix}.json"
+
+
+def _read_index(arch: str, country: Optional[str]) -> int:
+    try:
+        return json.loads(_index_path(arch, country).read_text()).get("i", 0)
+    except (OSError, json.JSONDecodeError):
+        return 0
+
+
+def _write_index(i: int, arch: str, country: Optional[str]) -> None:
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _index_path(arch, country).write_text(json.dumps({"i": i}))
+
+
+def pick_pool_token(
+    arch: str = "arm64",
+    country: Optional[str] = None,
+    proxy: Optional[str] = None,
+    dispenser_url: Optional[str] = None,
+    profile: Optional[str] = None,
+    size: int = DEFAULT_PROBES,
+) -> Optional[dict]:
+    """Ensure the pool is full, then return the next token in round-robin order.
+
+    Expired tokens are pruned and refetched by ensure_pool before picking.
+    The round-robin index is persisted to disk so it survives across invocations.
+    """
+    pool = ensure_pool(arch=arch, country=country, proxy=proxy,
+                       dispenser_url=dispenser_url, profile=profile, size=size)
+    if not pool:
+        return None
+    i = _read_index(arch, country)
+    token = pool[i % len(pool)]
+    _write_index(i + 1, arch, country)
+    return token
+
+
 def replace_pool_token(
     failed_token: dict,
     arch: str = "arm64",

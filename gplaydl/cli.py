@@ -17,8 +17,11 @@ from gplaydl import __version__
 from gplaydl.api import (
     AuthExpiredError,
     PlayAPIError,
+    fetch_app_item,
     get_delivery,
     get_details,
+    get_details_raw,
+    parse_app_item,
     list_splits as api_list_splits,
     purchase,
     search_apps,
@@ -28,6 +31,7 @@ from gplaydl.auth import (
     DEFAULT_PROBES,
     ensure_auth,
     ensure_pool,
+    pick_pool_token,
     replace_pool_token,
     save_auth,
 )
@@ -244,24 +248,36 @@ def info(
     country: Optional[str] = typer.Option(None, "--country", "-c", help="2-letter country code (e.g. US, IN, DE). Sets gl= and locale headers. For true regional versions, combine with --proxy."),
     proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL for FDFE calls, e.g. socks5://host:port or http://host:port. Routes requests through a regional IP."),
     profile: Optional[str] = typer.Option(None, "--profile", help="Device profile key or name substring (e.g. 'D2' or 'samsung'). Run 'gplaydl profiles' to list all."),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Print full decoded protobuf response as JSON."),
 ) -> None:
     """Show app details from Google Play.
 
     Use --country to set region headers, and --proxy to route through a
     regional IP (required for apps with region-specific version tracks).
+    Use --raw to dump the full decoded protobuf response as JSON.
     """
-    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
+    import json as _json
 
     with console.status(f"Fetching details for [bold]{package}[/bold]..."):
         try:
-            try:
-                details = get_details(package, auth_data, country=country, proxy=proxy)
-            except AuthExpiredError:
-                auth_data = _require_auth(arch, dispenser, force=True, country=country, proxy=proxy, profile=profile)
-                details = get_details(package, auth_data, country=country, proxy=proxy)
+            if raw:
+                item = fetch_app_item(package, arch=arch, country=country, proxy=proxy,
+                                      profile=profile, dispenser_url=dispenser)
+            else:
+                auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
+                try:
+                    details = get_details(package, auth_data, country=country, proxy=proxy)
+                except AuthExpiredError:
+                    replace_pool_token(auth_data, arch=arch, country=country, proxy=proxy, dispenser_url=dispenser)
+                    auth_data = _require_auth(arch, dispenser, country=country, proxy=proxy, profile=profile)
+                    details = get_details(package, auth_data, country=country, proxy=proxy)
         except PlayAPIError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
+
+    if raw:
+        print(_json.dumps(item, indent=2, ensure_ascii=False))
+        return
 
     table = Table(title=details.title or package, show_header=False, title_style="bold")
     table.add_column("Field", style="dim")
@@ -372,11 +388,10 @@ def download(
 ) -> None:
     """Download an APK (with splits + additional files) from Google Play."""
     output.mkdir(parents=True, exist_ok=True)
-    pool = ensure_pool(arch=arch, country=country, proxy=proxy, dispenser_url=dispenser, profile=profile)
-    if not pool:
+    auth_data = pick_pool_token(arch=arch, country=country, proxy=proxy, dispenser_url=dispenser, profile=profile)
+    if not auth_data:
         err.print("[red]Could not obtain an auth token — dispenser may be rate-limiting.[/red]")
         raise typer.Exit(code=1)
-    auth_data = pool[0]
 
     # ── resolve --version to an int version code ─────────────────────────
     resolved_vc: Optional[int] = None
@@ -506,8 +521,9 @@ def _require_auth(
     force: bool = False, proxy: Optional[str] = None,
     country: Optional[str] = None, profile: Optional[str] = None,
 ) -> dict:
-    """Return auth dict or exit with a helpful error."""
-    data = ensure_auth(arch=arch, dispenser_url=dispenser, force_refresh=force, proxy=proxy, country=country, profile=profile)
+    """Return next round-robin pool token, ensuring pool is full first."""
+    data = pick_pool_token(arch=arch, country=country, proxy=proxy,
+                           dispenser_url=dispenser, profile=profile)
     if not data:
         err.print(
             "[red]Could not obtain an auth token. "
